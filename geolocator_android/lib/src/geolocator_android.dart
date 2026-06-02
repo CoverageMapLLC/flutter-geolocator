@@ -8,13 +8,11 @@ import 'package:uuid/uuid.dart';
 /// An implementation of [GeolocatorPlatform] that uses method channels.
 class GeolocatorAndroid extends GeolocatorPlatform {
   /// The method channel used to interact with the native platform.
-  static const _methodChannel =
-      MethodChannel('flutter.baseflow.com/geolocator_android');
+  static const _methodChannel = MethodChannel('flutter.baseflow.com/geolocator_android');
 
   /// The event channel used to receive [Position] updates from the native
   /// platform.
-  static const _eventChannel =
-      EventChannel('flutter.baseflow.com/geolocator_updates_android');
+  static const _eventChannel = EventChannel('flutter.baseflow.com/geolocator_updates_android');
 
   /// The event channel used to receive [LocationServiceStatus] updates from the
   /// native platform.
@@ -32,8 +30,10 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   /// ignored.
   bool forcedLocationManager = false;
 
-  Stream<Position>? _positionStream;
   Stream<ServiceStatus>? _serviceStatusStream;
+  StreamSubscription<dynamic>? _positionEventSubscription;
+  final Map<String, StreamController<Position>> _positionStreamControllers =
+      <String, StreamController<Position>>{};
 
   final Uuid _uuid = const Uuid();
 
@@ -41,8 +41,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   Future<LocationPermission> checkPermission() async {
     try {
       // ignore: omit_local_variable_types
-      final int permission =
-          await _methodChannel.invokeMethod('checkPermission');
+      final int permission = await _methodChannel.invokeMethod('checkPermission');
 
       return permission.toLocationPermission();
     } on PlatformException catch (e) {
@@ -56,8 +55,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   Future<LocationPermission> requestPermission() async {
     try {
       // ignore: omit_local_variable_types
-      final int permission =
-          await _methodChannel.invokeMethod('requestPermission');
+      final int permission = await _methodChannel.invokeMethod('requestPermission');
 
       return permission.toLocationPermission();
     } on PlatformException catch (e) {
@@ -68,9 +66,8 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   }
 
   @override
-  Future<bool> isLocationServiceEnabled() async => _methodChannel
-      .invokeMethod<bool>('isLocationServiceEnabled')
-      .then((value) => value ?? false);
+  Future<bool> isLocationServiceEnabled() async =>
+      _methodChannel.invokeMethod<bool>('isLocationServiceEnabled').then((value) => value ?? false);
 
   @override
   Future<Position?> getLastKnownPosition({
@@ -81,8 +78,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
         'forceLocationManager': forceLocationManager,
       };
 
-      final positionMap =
-          await _methodChannel.invokeMethod('getLastKnownPosition', parameters);
+      final positionMap = await _methodChannel.invokeMethod('getLastKnownPosition', parameters);
 
       return positionMap != null ? AndroidPosition.fromMap(positionMap) : null;
     } on PlatformException catch (e) {
@@ -94,8 +90,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
 
   @override
   Future<LocationAccuracyStatus> getLocationAccuracy() async {
-    final int accuracy =
-        await _methodChannel.invokeMethod('getLocationAccuracy');
+    final int accuracy = await _methodChannel.invokeMethod('getLocationAccuracy');
     return LocationAccuracyStatus.values[accuracy];
   }
 
@@ -146,8 +141,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
     if (_serviceStatusStream != null) {
       return _serviceStatusStream!;
     }
-    var serviceStatusStream =
-        _serviceStatusEventChannel.receiveBroadcastStream();
+    var serviceStatusStream = _serviceStatusEventChannel.receiveBroadcastStream();
 
     _serviceStatusStream = serviceStatusStream
         .map((dynamic element) => ServiceStatus.values[element as int])
@@ -166,49 +160,172 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   Stream<Position> getPositionStream({
     LocationSettings? locationSettings,
   }) {
-    if (_positionStream != null) {
-      return _positionStream!;
-    }
-    var originalStream = _eventChannel.receiveBroadcastStream(
-      locationSettings?.toJson(),
-    );
-    var positionStream = _wrapStream(originalStream);
+    final settings = locationSettings?.toJson();
+    final timeLimit = locationSettings?.timeLimit;
+    final requestId = _uuid.v4();
+    Future<void>? startRequestFuture;
 
-    var timeLimit = locationSettings?.timeLimit;
+    late StreamController<Position> streamController;
+    streamController = StreamController<Position>.broadcast(
+      onListen: () {
+        startRequestFuture = (() async {
+          _ensurePositionEventSubscription();
+          _positionStreamControllers[requestId] = streamController;
+
+          try {
+            await _methodChannel.invokeMethod<void>(
+              'startPositionUpdates',
+              <String, dynamic>{
+                ...?settings,
+                'requestId': requestId,
+              },
+            );
+          } on MissingPluginException {
+            // Backward-compatible no-op for environments that don't expose the
+            // start/stop position update methods yet.
+          } on PlatformException catch (e) {
+            _positionStreamControllers.remove(requestId);
+            streamController.addError(_handlePlatformException(e));
+            await streamController.close();
+            await _cancelPositionEventSubscriptionIfUnused();
+          }
+        })();
+      },
+      onCancel: () async {
+        await startRequestFuture;
+        await _stopPositionUpdates(requestId);
+      },
+    );
+
+    var positionStream = streamController.stream;
 
     if (timeLimit != null) {
       positionStream = positionStream.timeout(
         timeLimit,
-        onTimeout: (s) {
-          _positionStream = null;
-          s.addError(TimeoutException(
-            'Time limit reached while waiting for position update.',
-            timeLimit,
-          ));
-          s.close();
+        onTimeout: (sink) {
+          (startRequestFuture ?? Future<void>.value()).then((_) {
+            _stopPositionUpdates(requestId);
+          });
+          sink.addError(
+            TimeoutException(
+              'Time limit reached while waiting for position update.',
+              timeLimit,
+            ),
+          );
+          sink.close();
         },
       );
     }
 
-    _positionStream = positionStream
-        .map<Position>((dynamic element) =>
-            AndroidPosition.fromMap(element.cast<String, dynamic>()))
-        .handleError(
-      (error) {
+    return positionStream;
+  }
+
+  void _ensurePositionEventSubscription() {
+    if (_positionStreamControllers.isEmpty && _positionEventSubscription != null) {
+      _positionEventSubscription!.cancel();
+      _positionEventSubscription = null;
+    }
+
+    if (_positionEventSubscription != null) {
+      return;
+    }
+
+    _positionEventSubscription = _eventChannel.receiveBroadcastStream().listen(
+      (dynamic event) {
+        if (event is! Map) {
+          return;
+        }
+
+        final data = event.cast<String, dynamic>();
+        final eventType = data['eventType'] as String?;
+
+        if (eventType == null && data.containsKey('latitude')) {
+          final position = AndroidPosition.fromMap(data);
+          for (final controller in _positionStreamControllers.values) {
+            controller.add(position);
+          }
+          return;
+        }
+
+        final requestId = data['requestId'] as String?;
+        if (requestId == null) {
+          return;
+        }
+
+        final controller = _positionStreamControllers[requestId];
+        if (controller == null) {
+          return;
+        }
+
+        switch (eventType) {
+          case 'position':
+            final positionMap = data['position'];
+            if (positionMap is Map) {
+              controller.add(
+                AndroidPosition.fromMap(positionMap.cast<String, dynamic>()),
+              );
+            }
+            break;
+          case 'error':
+            final errorCode = data['errorCode'] as String? ?? 'LOCATION_UPDATE_FAILURE';
+            final errorDescription = data['errorDescription'] as String?;
+            final exception = _handlePlatformException(
+              PlatformException(
+                code: errorCode,
+                message: errorDescription,
+              ),
+            );
+            controller.addError(exception);
+            break;
+          default:
+            break;
+        }
+      },
+      onError: (dynamic error) {
         if (error is PlatformException) {
           error = _handlePlatformException(error);
         }
-        throw error;
+        for (final controller in _positionStreamControllers.values) {
+          controller.addError(error);
+        }
+      },
+      onDone: () {
+        for (final controller in _positionStreamControllers.values) {
+          controller.close();
+        }
+        _positionStreamControllers.clear();
+        _positionEventSubscription = null;
       },
     );
-    return _positionStream!;
   }
 
-  Stream<dynamic> _wrapStream(Stream<dynamic> incoming) {
-    return incoming.asBroadcastStream(onCancel: (subscription) {
-      subscription.cancel();
-      _positionStream = null;
-    });
+  Future<void> _stopPositionUpdates(String requestId) async {
+    _positionStreamControllers.remove(requestId);
+
+    try {
+      await _methodChannel.invokeMethod<void>(
+        'stopPositionUpdates',
+        <String, dynamic>{
+          'requestId': requestId,
+        },
+      );
+    } on MissingPluginException {
+      // Backward-compatible no-op for environments that don't expose the
+      // start/stop position update methods yet.
+    } on PlatformException {
+      // Ignored intentionally; best effort cleanup.
+    }
+
+    await _cancelPositionEventSubscriptionIfUnused();
+  }
+
+  Future<void> _cancelPositionEventSubscriptionIfUnused() async {
+    if (_positionStreamControllers.isNotEmpty || _positionEventSubscription == null) {
+      return;
+    }
+
+    await _positionEventSubscription?.cancel();
+    _positionEventSubscription = null;
   }
 
   @override
@@ -230,14 +347,61 @@ class GeolocatorAndroid extends GeolocatorPlatform {
   }
 
   @override
-  Future<bool> openAppSettings() async => _methodChannel
-      .invokeMethod<bool>('openAppSettings')
-      .then((value) => value ?? false);
+  Future<bool> openAppSettings() async =>
+      _methodChannel.invokeMethod<bool>('openAppSettings').then((value) => value ?? false);
 
   @override
-  Future<bool> openLocationSettings() async => _methodChannel
-      .invokeMethod<bool>('openLocationSettings')
-      .then((value) => value ?? false);
+  Future<bool> openLocationSettings() async =>
+      _methodChannel.invokeMethod<bool>('openLocationSettings').then((value) => value ?? false);
+
+  /// Acquires Android foreground mode.
+  ///
+  /// If [foregroundNotificationConfig] is omitted, the native layer will use
+  /// previously stored foreground settings.
+  Future<String> aquireForegroundMode({
+    ForegroundNotificationConfig? foregroundNotificationConfig,
+  }) async {
+    final leaseId = await _methodChannel.invokeMethod<String>(
+      'aquireForegroundMode',
+      <String, dynamic>{
+        'foregroundNotificationConfig': foregroundNotificationConfig?.toJson(),
+      },
+    );
+
+    if (leaseId == null || leaseId.isEmpty) {
+      throw PlatformException(
+        code: 'INVALID_FOREGROUND_LEASE',
+        message: 'No foreground lease id was returned by the platform.',
+      );
+    }
+
+    return leaseId;
+  }
+
+  /// Updates foreground settings (notification and locks).
+  ///
+  /// This can be called before foreground mode is acquired. In that case,
+  /// settings are persisted and used as defaults when foreground mode is
+  /// acquired later.
+  Future<void> updateForegroundSettings(
+      {required ForegroundNotificationConfig foregroundNotificationConfig}) {
+    return _methodChannel.invokeMethod<void>(
+      'updateForegroundSettings',
+      <String, dynamic>{
+        'foregroundNotificationConfig': foregroundNotificationConfig.toJson(),
+      },
+    );
+  }
+
+  /// Releases Android foreground mode.
+  Future<void> releaseForegroundMode({required String leaseId}) {
+    return _methodChannel.invokeMethod<void>(
+      'releaseForegroundMode',
+      <String, dynamic>{
+        'leaseId': leaseId,
+      },
+    );
+  }
 
   Exception _handlePlatformException(PlatformException exception) {
     switch (exception.code) {

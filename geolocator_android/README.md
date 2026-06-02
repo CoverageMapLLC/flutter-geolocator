@@ -10,6 +10,39 @@ Since version 7.4.0 of the [geolocator](https://pub.dev/packages/geolocator) plu
 
 More detailed instructions on using the API can be found in the [README.md](../geolocator/README.md) of the [geolocator](https://pub.dev/packages/geolocator) package.
 
+## Android-specific foreground mode control
+
+The Android implementation exposes additional APIs through `GeolocatorAndroid`
+to control foreground mode independently from `getPositionStream`.
+
+```dart
+final geolocator = GeolocatorAndroid();
+
+final leaseId = await geolocator.aquireForegroundMode(
+	foregroundNotificationConfig: const ForegroundNotificationConfig(
+		notificationTitle: 'Location active',
+		notificationText: 'Tracking in background',
+		enableWakeLock: true,
+	),
+);
+
+await geolocator.updateForegroundSettings(
+	foregroundNotificationConfig: const ForegroundNotificationConfig(
+		notificationTitle: 'Location running',
+		notificationText: 'Updated notification settings',
+	),
+);
+
+await geolocator.releaseForegroundMode(leaseId: leaseId);
+```
+
+Behavior notes:
+
+- Foreground mode uses a lease-based ownership model.
+- Multiple foreground owners can coexist (explicit leases and stream-level leases).
+- Foreground mode remains active until all owners release their leases.
+- The latest foreground notification configuration is applied and retained as defaults for future activation.
+
 ## Issues
 
 Please file any issues, bugs or feature requests as an issue on our [GitHub](https://github.com/Baseflow/flutter-geolocator/issues) page. Commercial support is available, you can contact us at <hello@baseflow.com>.

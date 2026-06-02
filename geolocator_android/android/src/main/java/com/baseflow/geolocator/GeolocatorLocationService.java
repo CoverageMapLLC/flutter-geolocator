@@ -17,14 +17,21 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 
 import com.baseflow.geolocator.errors.ErrorCodes;
+import com.baseflow.geolocator.errors.ErrorCallback;
 import com.baseflow.geolocator.location.BackgroundNotification;
 import com.baseflow.geolocator.location.ForegroundNotificationOptions;
 import com.baseflow.geolocator.location.GeolocationManager;
 import com.baseflow.geolocator.location.LocationClient;
-import com.baseflow.geolocator.location.LocationMapper;
 import com.baseflow.geolocator.location.LocationOptions;
+import com.baseflow.geolocator.location.PositionChangedCallback;
 
 import io.flutter.plugin.common.EventChannel;
+
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class GeolocatorLocationService extends Service {
   private static final String TAG = "FlutterGeolocator";
@@ -39,12 +46,15 @@ public class GeolocatorLocationService extends Service {
   private int listenerCount = 0;
   @Nullable private Activity activity = null;
   @Nullable private GeolocationManager geolocationManager = null;
-  @Nullable private LocationClient locationClient;
+  private final Map<String, LocationClient> foregroundLocationClients = new ConcurrentHashMap<>();
 
   @Nullable private PowerManager.WakeLock wakeLock = null;
   @Nullable private WifiManager.WifiLock wifiLock = null;
 
   @Nullable private BackgroundNotification backgroundNotification = null;
+  @Nullable private ForegroundNotificationOptions foregroundNotificationOptions = null;
+  private final Set<String> explicitForegroundLeaseIds = new HashSet<>();
+  private final Set<String> streamForegroundLeaseIds = new HashSet<>();
 
   @Override
   public void onCreate() {
@@ -102,56 +112,167 @@ public class GeolocatorLocationService extends Service {
     Log.d(TAG, "Flutter engine disconnected. Connected engine count " + connectedEngines);
   }
 
-  public void startLocationService(
+  public boolean startLocationService(
+      String requestId,
       boolean forceLocationManager,
       LocationOptions locationOptions,
-      EventChannel.EventSink events) {
+      PositionChangedCallback positionChangedCallback,
+      ErrorCallback errorCallback) {
 
-    listenerCount++;
-    if (geolocationManager != null) {
-      locationClient =
-          geolocationManager.createLocationClient(
-              this.getApplicationContext(),
-              Boolean.TRUE.equals(forceLocationManager),
-              locationOptions);
-
-      geolocationManager.startPositionUpdates(
-          locationClient,
-          activity,
-          (Location location) -> events.success(LocationMapper.toHashMap(location)),
-          (ErrorCodes errorCodes) ->
-              events.error(errorCodes.toString(), errorCodes.toDescription(), null));
+    if (foregroundLocationClients.containsKey(requestId)) {
+      return true;
     }
+
+    if (geolocationManager == null) {
+      return false;
+    }
+
+    LocationClient locationClient =
+        geolocationManager.createLocationClient(
+            this.getApplicationContext(),
+            Boolean.TRUE.equals(forceLocationManager),
+            locationOptions
+        );
+
+    foregroundLocationClients.put(requestId, locationClient);
+    listenerCount++;
+
+    geolocationManager.startPositionUpdates(
+        locationClient,
+        activity,
+        positionChangedCallback,
+        errorCallback
+    );
+
+    return true;
   }
 
-  public void stopLocationService() {
-    listenerCount--;
-    Log.d(TAG, "Stopping location service.");
-    if (locationClient != null && geolocationManager != null) {
+  public void stopLocationService(String requestId) {
+    Log.d(TAG, "Stopping location service for request " + requestId);
+
+    if (geolocationManager == null) {
+      return;
+    }
+
+    LocationClient locationClient = foregroundLocationClients.remove(requestId);
+    if (locationClient != null) {
+      listenerCount = Math.max(0, listenerCount - 1);
       geolocationManager.stopPositionUpdates(locationClient);
     }
   }
 
-  public void enableBackgroundMode(ForegroundNotificationOptions options) {
-    if (backgroundNotification != null) {
-      Log.d(TAG, "Service already in foreground mode.");
-      changeNotificationOptions(options);
-    } else {
-      Log.d(TAG, "Start service in foreground mode.");
-
-      backgroundNotification =
-          new BackgroundNotification(
-              this.getApplicationContext(), CHANNEL_ID, ONGOING_NOTIFICATION_ID, options);
-      backgroundNotification.updateChannel(options.getNotificationChannelName());
-      Notification notification = backgroundNotification.build();
-      startForeground(ONGOING_NOTIFICATION_ID, notification);
-      isForeground = true;
+  public void stopLocationService() {
+    if (geolocationManager == null) {
+      foregroundLocationClients.clear();
+      listenerCount = 0;
+      return;
     }
-    obtainWakeLocks(options);
+
+    for (LocationClient locationClient : foregroundLocationClients.values()) {
+      geolocationManager.stopPositionUpdates(locationClient);
+    }
+
+    foregroundLocationClients.clear();
+    listenerCount = 0;
+  }
+
+  @Nullable
+  public String acquireExplicitForegroundMode(@Nullable ForegroundNotificationOptions options) {
+    boolean isEnabled = ensureForegroundModeEnabled(options);
+    if (!isEnabled) {
+      return null;
+    }
+
+    String leaseId = UUID.randomUUID().toString();
+    explicitForegroundLeaseIds.add(leaseId);
+    return leaseId;
+  }
+
+  public boolean releaseExplicitForegroundMode(String leaseId) {
+    boolean wasRemoved = explicitForegroundLeaseIds.remove(leaseId);
+    if (!wasRemoved) {
+      return false;
+    }
+
+    disableBackgroundModeIfNeeded();
+    return true;
+  }
+
+  @Nullable
+  public String acquireStreamForegroundMode(@Nullable ForegroundNotificationOptions options) {
+    boolean isEnabled = ensureForegroundModeEnabled(options);
+    if (!isEnabled) {
+      return null;
+    }
+
+    String leaseId = UUID.randomUUID().toString();
+    streamForegroundLeaseIds.add(leaseId);
+    return leaseId;
+  }
+
+  public boolean releaseStreamForegroundMode(String leaseId) {
+    boolean wasRemoved = streamForegroundLeaseIds.remove(leaseId);
+    if (!wasRemoved) {
+      return false;
+    }
+
+    disableBackgroundModeIfNeeded();
+    return true;
   }
 
   @SuppressWarnings("deprecation")
   public void disableBackgroundMode() {
+    explicitForegroundLeaseIds.clear();
+    streamForegroundLeaseIds.clear();
+    disableBackgroundModeInternal();
+  }
+
+  private boolean ensureForegroundModeEnabled(@Nullable ForegroundNotificationOptions options) {
+    if (options != null) {
+      foregroundNotificationOptions = options;
+    }
+
+    if (foregroundNotificationOptions == null) {
+      Log.e(TAG, "Cannot enable foreground mode without foreground settings.");
+      return false;
+    }
+
+    if (backgroundNotification != null) {
+      Log.d(TAG, "Service already in foreground mode.");
+      changeNotificationOptions(foregroundNotificationOptions);
+    } else {
+      Log.d(TAG, "Start service in foreground mode.");
+
+      backgroundNotification = new BackgroundNotification(
+          this.getApplicationContext(),
+          CHANNEL_ID,
+          ONGOING_NOTIFICATION_ID,
+          foregroundNotificationOptions
+      );
+
+      backgroundNotification.updateChannel(
+          foregroundNotificationOptions.getNotificationChannelName()
+      );
+
+      Notification notification = backgroundNotification.build();
+      startForeground(ONGOING_NOTIFICATION_ID, notification);
+      isForeground = true;
+    }
+
+    obtainWakeLocks(foregroundNotificationOptions);
+    return true;
+  }
+
+  private void disableBackgroundModeIfNeeded() {
+    if (!explicitForegroundLeaseIds.isEmpty() || !streamForegroundLeaseIds.isEmpty()) {
+      return;
+    }
+
+    disableBackgroundModeInternal();
+  }
+
+  @SuppressWarnings("deprecation")
+  private void disableBackgroundModeInternal() {
     if (isForeground) {
       Log.d(TAG, "Stop service in foreground.");
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -166,6 +287,7 @@ public class GeolocatorLocationService extends Service {
   }
 
   public void changeNotificationOptions(ForegroundNotificationOptions options) {
+    foregroundNotificationOptions = options;
     if (backgroundNotification != null) {
       backgroundNotification.updateOptions(options, isForeground);
       obtainWakeLocks(options);
@@ -177,7 +299,7 @@ public class GeolocatorLocationService extends Service {
   }
 
   public void setGeolocationManager(@Nullable GeolocationManager geolocationManager) {
-      this.geolocationManager = geolocationManager;
+    this.geolocationManager = geolocationManager;
   }
 
   private void releaseWakeLocks() {

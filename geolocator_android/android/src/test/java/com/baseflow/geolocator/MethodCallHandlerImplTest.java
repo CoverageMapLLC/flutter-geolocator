@@ -123,10 +123,13 @@ public class MethodCallHandlerImplTest {
   }
 
   private MethodCallHandlerImpl createMethodCallHandler() {
+    StreamHandlerImpl streamHandler = mock(StreamHandlerImpl.class);
+
     return new MethodCallHandlerImpl(
         mockPermissionManager,
         mockGeolocationManager,
-        mockLocationAccuracyManager
+        mockLocationAccuracyManager,
+        streamHandler
     );
   }
 }

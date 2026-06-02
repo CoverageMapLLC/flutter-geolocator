@@ -12,6 +12,7 @@ import androidx.annotation.VisibleForTesting;
 import com.baseflow.geolocator.errors.ErrorCodes;
 import com.baseflow.geolocator.errors.PermissionUndefinedException;
 import com.baseflow.geolocator.location.FlutterLocationServiceListener;
+import com.baseflow.geolocator.location.ForegroundNotificationOptions;
 import com.baseflow.geolocator.location.GeolocationManager;
 import com.baseflow.geolocator.location.LocationAccuracyStatus;
 import com.baseflow.geolocator.location.LocationAccuracyManager;
@@ -39,21 +40,29 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
   private final PermissionManager permissionManager;
   private final GeolocationManager geolocationManager;
   private final LocationAccuracyManager locationAccuracyManager;
+  private final StreamHandlerImpl streamHandler;
 
   @VisibleForTesting final Map<String, LocationClient> pendingCurrentPositionLocationClients;
+  @VisibleForTesting final Map<String, LocationClient> pendingPositionStreamLocationClients;
+  @VisibleForTesting final Map<String, String> pendingForegroundStreamLeases;
 
   @Nullable private Context context;
 
   @Nullable private Activity activity;
+  @Nullable private GeolocatorLocationService foregroundLocationService;
 
   MethodCallHandlerImpl(
       PermissionManager permissionManager,
       GeolocationManager geolocationManager,
-      LocationAccuracyManager locationAccuracyManager) {
+      LocationAccuracyManager locationAccuracyManager,
+      StreamHandlerImpl streamHandler) {
     this.permissionManager = permissionManager;
     this.geolocationManager = geolocationManager;
     this.locationAccuracyManager = locationAccuracyManager;
+    this.streamHandler = streamHandler;
     this.pendingCurrentPositionLocationClients = new HashMap<>();
+    this.pendingPositionStreamLocationClients = new HashMap<>();
+    this.pendingForegroundStreamLeases = new HashMap<>();
   }
 
   @Nullable private MethodChannel channel;
@@ -82,6 +91,12 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       case "cancelGetCurrentPosition":
         onCancelGetCurrentPosition(call, result);
         break;
+      case "startPositionUpdates":
+        onStartPositionUpdates(call, result);
+        break;
+      case "stopPositionUpdates":
+        onStopPositionUpdates(call, result);
+        break;
       case "openAppSettings":
         boolean hasOpenedAppSettings = Utils.openAppSettings(this.context);
         result.success(hasOpenedAppSettings);
@@ -89,6 +104,15 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       case "openLocationSettings":
         boolean hasOpenedLocationSettings = Utils.openLocationSettings(this.context);
         result.success(hasOpenedLocationSettings);
+        break;
+      case "aquireForegroundMode":
+        onAquireForegroundMode(call, result);
+        break;
+      case "updateForegroundSettings":
+        onUpdateForegroundSettings(call, result);
+        break;
+      case "releaseForegroundMode":
+        onReleaseForegroundMode(call, result);
         break;
       default:
         result.notImplemented();
@@ -125,12 +149,19 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       return;
     }
 
+    stopAllPositionStreams();
+
     channel.setMethodCallHandler(null);
     channel = null;
   }
 
   void setActivity(@Nullable Activity activity) {
     this.activity = activity;
+  }
+
+  void setForegroundLocationService(
+      @Nullable GeolocatorLocationService foregroundLocationService) {
+    this.foregroundLocationService = foregroundLocationService;
   }
 
   private void onCheckPermission(MethodChannel.Result result) {
@@ -145,7 +176,9 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
 
   private void onIsLocationServiceEnabled(MethodChannel.Result result) {
     geolocationManager.isLocationServiceEnabled(
-        context, new FlutterLocationServiceListener(result));
+        context,
+        new FlutterLocationServiceListener(result)
+    );
   }
 
   private void onRequestPermission(MethodChannel.Result result) {
@@ -154,7 +187,8 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
           activity,
           (LocationPermission permission) -> result.success(permission.toInt()),
           (ErrorCodes errorCode) ->
-              result.error(errorCode.toString(), errorCode.toDescription(), null));
+            result.error(errorCode.toString(), errorCode.toDescription(), null)
+        );
     } catch (PermissionUndefinedException e) {
       ErrorCodes errorCode = ErrorCodes.permissionDefinitionsNotFound;
       result.error(errorCode.toString(), errorCode.toDescription(), null);
@@ -166,7 +200,8 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
         locationAccuracyManager.getLocationAccuracy(
             context,
             (ErrorCodes errorCode) ->
-                result.error(errorCode.toString(), errorCode.toDescription(), null));
+            result.error(errorCode.toString(), errorCode.toDescription(), null)
+        );
     if (status != null) {
       result.success(status.ordinal());
     }
@@ -196,7 +231,8 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
         forceLocationManager != null && forceLocationManager,
         (Location location) -> result.success(LocationMapper.toHashMap(location)),
         (ErrorCodes errorCode) ->
-            result.error(errorCode.toString(), errorCode.toDescription(), null));
+        result.error(errorCode.toString(), errorCode.toDescription(), null)
+    );
   }
 
   /**
@@ -235,7 +271,11 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
     final boolean[] replySubmitted = {false};
 
     LocationClient locationClient =
-        geolocationManager.createLocationClient(context, forceLocationManager, locationOptions);
+      geolocationManager.createLocationClient(
+        context,
+        forceLocationManager,
+        locationOptions
+      );
     pendingCurrentPositionLocationClients.put(requestId, locationClient);
 
     geolocationManager.startPositionUpdates(
@@ -260,7 +300,8 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
           geolocationManager.stopPositionUpdates(locationClient);
           pendingCurrentPositionLocationClients.remove(requestId);
           result.error(errorCode.toString(), errorCode.toDescription(), null);
-        });
+        }
+    );
   }
 
   /**
@@ -276,6 +317,224 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       locationClient.stopPositionUpdates();
     }
     this.pendingCurrentPositionLocationClients.remove(requestId);
+
+    result.success(null);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void onStartPositionUpdates(MethodCall call, MethodChannel.Result result) {
+    if (!streamHandler.hasActiveEventSink()) {
+      result.error(
+          ErrorCodes.errorWhileAcquiringPosition.toString(),
+          "Position update event channel is not listening.",
+          null);
+      return;
+    }
+
+    try {
+      if (!permissionManager.hasPermission(context)) {
+        result.error(
+            ErrorCodes.permissionDenied.toString(),
+            ErrorCodes.permissionDenied.toDescription(),
+            null);
+        return;
+      }
+    } catch (PermissionUndefinedException e) {
+      result.error(
+          ErrorCodes.permissionDefinitionsNotFound.toString(),
+          ErrorCodes.permissionDefinitionsNotFound.toDescription(),
+          null);
+      return;
+    }
+
+    Map<String, Object> map = (Map<String, Object>) call.arguments;
+    String requestId = map == null ? null : (String) map.get("requestId");
+    if (requestId == null || requestId.isEmpty()) {
+      result.error("ARGUMENT_ERROR", "requestId is required.", null);
+      return;
+    }
+
+    boolean forceLocationManager = false;
+    if (map != null && map.get("forceLocationManager") != null) {
+      forceLocationManager = (boolean) map.get("forceLocationManager");
+    }
+
+    LocationOptions locationOptions = LocationOptions.parseArguments(map);
+    ForegroundNotificationOptions foregroundNotificationOptions = null;
+    if (map != null) {
+      foregroundNotificationOptions =
+          ForegroundNotificationOptions.parseArguments(
+              (Map<String, Object>) map.get("foregroundNotificationConfig"));
+    }
+
+    if (foregroundNotificationOptions != null) {
+      if (foregroundLocationService == null) {
+        result.error("LOCATION_SERVICE_NOT_INITIALIZED", "Foreground service is not initialized.", null);
+        return;
+      }
+
+      String leaseId = foregroundLocationService.acquireStreamForegroundMode(foregroundNotificationOptions);
+      if (leaseId == null) {
+        result.error("ARGUMENT_ERROR", "foregroundNotificationConfig is required.", null);
+        return;
+      }
+
+      pendingForegroundStreamLeases.put(requestId, leaseId);
+
+      boolean started =
+          foregroundLocationService.startLocationService(
+              requestId,
+              forceLocationManager,
+              locationOptions,
+              (Location location) -> streamHandler.emitPosition(requestId, location),
+              (ErrorCodes errorCodes) -> {
+                streamHandler.emitError(requestId, errorCodes);
+                stopPositionUpdatesInternal(requestId);
+              }
+          );
+
+      if (!started) {
+        pendingForegroundStreamLeases.remove(requestId);
+        foregroundLocationService.releaseStreamForegroundMode(leaseId);
+        streamHandler.emitError(requestId, ErrorCodes.errorWhileAcquiringPosition);
+        return;
+      }
+
+      result.success(null);
+
+      return;
+    }
+
+    LocationClient locationClient =
+        geolocationManager.createLocationClient(
+            context,
+            forceLocationManager,
+            locationOptions
+        );
+
+    pendingPositionStreamLocationClients.put(requestId, locationClient);
+
+    geolocationManager.startPositionUpdates(
+        locationClient,
+        activity,
+        (Location location) -> streamHandler.emitPosition(requestId, location),
+        (ErrorCodes errorCodes) -> {
+          streamHandler.emitError(requestId, errorCodes);
+          stopPositionUpdatesInternal(requestId);
+        }
+    );
+
+      result.success(null);
+
+  }
+
+  @SuppressWarnings("unchecked")
+  private void onStopPositionUpdates(MethodCall call, MethodChannel.Result result) {
+    Map<String, Object> arguments = (Map<String, Object>) call.arguments;
+    String requestId = arguments == null ? null : (String) arguments.get("requestId");
+    if (requestId == null || requestId.isEmpty()) {
+      result.error("ARGUMENT_ERROR", "requestId is required.", null);
+      return;
+    }
+
+    stopPositionUpdatesInternal(requestId);
+    result.success(null);
+  }
+
+  private void stopPositionUpdatesInternal(String requestId) {
+    LocationClient locationClient = pendingPositionStreamLocationClients.remove(requestId);
+    if (locationClient != null) {
+      geolocationManager.stopPositionUpdates(locationClient);
+    }
+
+    String leaseId = pendingForegroundStreamLeases.remove(requestId);
+    if (leaseId != null && foregroundLocationService != null) {
+      foregroundLocationService.stopLocationService(requestId);
+      foregroundLocationService.releaseStreamForegroundMode(leaseId);
+    }
+  }
+
+  private void stopAllPositionStreams() {
+    for (String requestId : new HashMap<>(pendingPositionStreamLocationClients).keySet()) {
+      stopPositionUpdatesInternal(requestId);
+    }
+
+    for (String requestId : new HashMap<>(pendingForegroundStreamLeases).keySet()) {
+      stopPositionUpdatesInternal(requestId);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private void onAquireForegroundMode(MethodCall call, MethodChannel.Result result) {
+    if (foregroundLocationService == null) {
+      result.error("LOCATION_SERVICE_NOT_INITIALIZED", "Foreground service is not initialized.", null);
+      return;
+    }
+
+    Map<String, Object> arguments = (Map<String, Object>) call.arguments;
+    ForegroundNotificationOptions options =
+        ForegroundNotificationOptions.parseArguments(
+        arguments == null
+          ? null
+          : (Map<String, Object>) arguments.get("foregroundNotificationConfig")
+      );
+
+    String leaseId = foregroundLocationService.acquireExplicitForegroundMode(options);
+    if (leaseId == null) {
+      result.error(
+          "ARGUMENT_ERROR",
+          "No foreground settings available. Call updateForegroundSettings or provide foregroundNotificationConfig.",
+          null
+        );
+      return;
+    }
+
+    result.success(leaseId);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void onUpdateForegroundSettings(MethodCall call, MethodChannel.Result result) {
+    if (foregroundLocationService == null) {
+      result.error("LOCATION_SERVICE_NOT_INITIALIZED", "Foreground service is not initialized.", null);
+      return;
+    }
+
+    Map<String, Object> arguments = (Map<String, Object>) call.arguments;
+    ForegroundNotificationOptions options =
+        ForegroundNotificationOptions.parseArguments(
+        arguments == null
+          ? null
+          : (Map<String, Object>) arguments.get("foregroundNotificationConfig")
+      );
+
+    if (options == null) {
+      result.error("ARGUMENT_ERROR", "foregroundNotificationConfig is required.", null);
+      return;
+    }
+
+    foregroundLocationService.changeNotificationOptions(options);
+    result.success(null);
+  }
+
+  private void onReleaseForegroundMode(MethodCall call, MethodChannel.Result result) {
+    if (foregroundLocationService == null) {
+      result.error("LOCATION_SERVICE_NOT_INITIALIZED", "Foreground service is not initialized.", null);
+      return;
+    }
+
+    @SuppressWarnings("unchecked")
+    Map<String, Object> arguments = (Map<String, Object>) call.arguments;
+    String leaseId = arguments == null ? null : (String) arguments.get("leaseId");
+    if (leaseId == null || leaseId.isEmpty()) {
+      result.error("ARGUMENT_ERROR", "leaseId is required.", null);
+      return;
+    }
+
+    boolean released = foregroundLocationService.releaseExplicitForegroundMode(leaseId);
+    if (!released) {
+      result.error("INVALID_FOREGROUND_LEASE", "Unknown explicit foreground lease id.", null);
+      return;
+    }
 
     result.success(null);
   }
