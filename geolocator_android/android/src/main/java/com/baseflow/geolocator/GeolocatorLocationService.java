@@ -130,7 +130,7 @@ public class GeolocatorLocationService extends Service {
     LocationClient locationClient =
         geolocationManager.createLocationClient(
             this.getApplicationContext(),
-            Boolean.TRUE.equals(forceLocationManager),
+            forceLocationManager,
             locationOptions
         );
 

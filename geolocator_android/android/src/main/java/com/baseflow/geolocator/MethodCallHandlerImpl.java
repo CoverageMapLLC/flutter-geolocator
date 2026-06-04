@@ -55,7 +55,8 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       PermissionManager permissionManager,
       GeolocationManager geolocationManager,
       LocationAccuracyManager locationAccuracyManager,
-      StreamHandlerImpl streamHandler) {
+      StreamHandlerImpl streamHandler
+  ) {
     this.permissionManager = permissionManager;
     this.geolocationManager = geolocationManager;
     this.locationAccuracyManager = locationAccuracyManager;
