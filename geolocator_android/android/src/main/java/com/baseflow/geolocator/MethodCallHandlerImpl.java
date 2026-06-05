@@ -397,12 +397,12 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
       if (!started) {
         pendingForegroundStreamLeases.remove(requestId);
         foregroundLocationService.releaseStreamForegroundMode(leaseId);
+        result.success(null);
         streamHandler.emitError(requestId, ErrorCodes.errorWhileAcquiringPosition);
         return;
       }
 
       result.success(null);
-
       return;
     }
 
@@ -425,8 +425,7 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
         }
     );
 
-      result.success(null);
-
+    result.success(null);
   }
 
   @SuppressWarnings("unchecked")

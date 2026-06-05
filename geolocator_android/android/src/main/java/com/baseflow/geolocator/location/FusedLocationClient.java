@@ -156,7 +156,10 @@ class FusedLocationClient implements LocationClient {
     LocationRequest locationRequest = buildLocationRequest(locationOptions);
     this.nmeaClient.start();
     fusedLocationProviderClient.requestLocationUpdates(
-        locationRequest, locationCallback, Looper.getMainLooper());
+        locationRequest,
+        locationCallback,
+        Looper.getMainLooper()
+    );
   }
 
   @Override
