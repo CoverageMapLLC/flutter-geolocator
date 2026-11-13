@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "repository": {
+    "owner": "CoverageMapLLC",
+    "name": "flutter-geolocator"
+  },
+  "updatedAt": "2026-11-13T20:38:30.750Z",
+  "config": {
+    "name": "flutter-geolocator",
+    "description": "Android and iOS Geolocation plugin for Flutter",
+    "responsibilities": [],
+    "tags": [],
+    "instructions": "",
+    "branchMapping": {},
+    "relationships": []
+  }
+}
