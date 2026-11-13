@@ -4,7 +4,7 @@
     "owner": "CoverageMapLLC",
     "name": "flutter-geolocator"
   },
-  "updatedAt": "2026-11-13T20:38:40.426Z",
+  "updatedAt": "2026-11-13T20:38:55.613Z",
   "config": {
     "name": "Flutter Geolocator",
     "description": "Android and iOS Geolocation plugin for Flutter",
@@ -12,6 +12,8 @@
     "tags": [],
     "instructions": "",
     "branchMapping": {},
-    "relationships": []
+    "relationships": [],
+    "icon": "map-pin",
+    "color": "green"
   }
 }
